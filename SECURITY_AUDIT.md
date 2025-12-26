@@ -53,9 +53,9 @@
 No additional chains proven beyond the single confirmed vulnerability.
 
 ## Priority check — RCE / SQLi
-- Ajax handlers reachable without authentication (`includes/classes/ajax/zcAjax*.php`) bind user input via `$db->bindVars` and contain no eval/exec, so no SQL injection or code-execution sink was found.
+- Ajax handlers reachable without authentication (`includes/classes/ajax/zcAjax*.php`) bind user input via `$db->bindVars` and contain no eval/exec, so no SQL injection or code execution sink was found.
 - Exec/eval usages uncovered (`admin/backup_mysql.php`, `admin/modules.php`, `admin/configuration.php`) are constrained to the admin backend guarded by `IS_ADMIN_FLAG`/session auth, keeping them out of unauthenticated reach.
 - Cloudloader code execution remains restricted to vendor-hosted payloads and was not found to be attacker-controlled.
 
 ## Conclusion
-One exploitable vulnerability was proven (unauthenticated admin notification dismissal). All other reviewed entrypoints either enforced sufficient control (token/whitelist) or relied on fixed upstream payloads without attacker influence. No further exploitable vulnerabilities were proven.
+One exploitable vulnerability was proven (unauthenticated admin notification dismissal). All other reviewed entry points either enforced sufficient control (token/whitelist) or relied on fixed upstream payloads without attacker influence. No further exploitable vulnerabilities were proven.
