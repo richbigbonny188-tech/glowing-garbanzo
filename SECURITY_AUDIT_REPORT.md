@@ -425,9 +425,10 @@ public function findPluginAdminPage($installedPlugins, $page)
 - **Full server compromise** with web server privileges
 
 **Proof Evidence Required:**
-- HTTP request with path traversal: `GET /admin/index.php?cmd=../../../../../../etc/passwd%00`
+- HTTP request with path traversal: `GET /admin/index.php?cmd=../../../uploads/evil` (where evil.php was previously uploaded)
 - For RCE: Chain with file upload to include uploaded PHP file
 - Server response showing included file content or code execution
+- Note: Null byte injection (`%00`) no longer works in PHP 5.3.4+; rely on path traversal and plugin directory structure
 
 **EXPLOITABILITY: CONFIRMED** (requires admin authentication; Known CVE with public advisory)
 
