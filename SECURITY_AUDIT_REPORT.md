@@ -92,6 +92,16 @@ This white-box security audit of the Deuth Zen Cart CMS (German customization of
 [USER CONTROL PRESERVED: PARTIALLY] (path restricted)
 ```
 
+### Flow 6: Email Archive Resend (CRITICAL - SQL Injection)
+```
+[ENTRYPOINT] /admin/email_archive_manager.php?action=resend&archive_id=X
+[SOURCE] $_GET['archive_id']
+[TRANSFORMATIONS]
+  - NONE - direct concatenation into SQL query
+[SINK] $db->Execute("select * from " . TABLE_EMAIL_ARCHIVE . " where archive_id = " . $_GET['archive_id'])
+[USER CONTROL PRESERVED: YES]
+```
+
 ---
 
 ## PHASE 3: CONTROL ELIMINATION FILTER
@@ -258,11 +268,16 @@ exec(LOCAL_EXE_UNZIP . ' ' . $restore_file . ' -d ' . DIR_FS_BACKUP);
 - File paths constructed from constants + user input
 - `escapeshellcmd()` used for password parameter
 
-**Impact:**
-- If restore file path can be manipulated, potential command injection
-- Requires specific server configuration
+**Residual Attack Vectors (Partially Mitigated):**
+- `$restore_file` is derived from the backup filename / `file` parameter in `/admin/backup_mysql.php` and is concatenated directly into the `exec()` command without shell escaping.
+- If an attacker can cause an admin to restore a backup whose filename (or path component) contains shell metacharacters (for example `;`, `&&`, `|`, backticks, or `$()`), those characters may be interpreted by the shell, resulting in command injection.
+- Exploitation typically requires: (a) an authenticated admin session, and (b) the ability to influence or control the backup filename (e.g., through file upload, filesystem write, or social engineering of the admin to use a crafted filename).
 
-**EXPLOITABILITY: LIMITED** (multiple conditions required, partial mitigation exists)
+**Impact:**
+- If the restore file path or filename portion of `$restore_file` can be manipulated to include shell metacharacters, there is a potential for command injection in the `exec()` calls shown above.
+- Requires specific server configuration (e.g., use of a real shell to execute commands) and the ability to influence backup filenames.
+
+**EXPLOITABILITY: LIMITED** (multiple conditions required; file-path based command injection remains possible via crafted backup filenames / `file` parameter despite partial mitigations)
 
 ---
 
@@ -284,13 +299,47 @@ eval('$keys .= ' . $value['set_function'] . '"' . zen_output_string($value['valu
 **Mitigating Factors:**
 - `set_function` comes from trusted database configuration
 - Input value sanitized via `zen_output_string()`
-- Backticks filtered to prevent command substitution
+- Backticks are replaced with the literal string `null;return;exit;` via `zen_output_string()`, intended to prevent command substitution
 
 **Impact:**
 - If database is compromised, could lead to RCE
 - Chained attack vector
 
 **EXPLOITABILITY: CHAIN-DEPENDENT** (requires prior database compromise)
+
+---
+
+### VULNERABILITY 7: SQL Injection in Email Archive Manager (CRITICAL)
+
+**Affected Entrypoint:** `/admin/email_archive_manager.php?action=resend`
+
+**Vulnerability Class:** CWE-89 (SQL Injection)
+
+**Exact Condition:**
+- Admin must be authenticated
+- `action` parameter set to `resend`
+- `archive_id` parameter is directly concatenated into SQL query without sanitization
+
+**Code Location:** `/admin/email_archive_manager.php`, line 32
+```php
+if ($action == 'resend') {
+    // collect the e-mail data
+    $email_sql = $db->Execute("select * from " . TABLE_EMAIL_ARCHIVE . " where archive_id = " . $_GET['archive_id']);
+```
+
+**Note:** The `delete` action on line 42 correctly uses `(int)$_GET['archive_id']` but the `resend` action does not.
+
+**Impact:**
+- Full SQL injection allowing data extraction, modification, or deletion
+- Potential for authentication bypass through UNION-based injection
+- Database takeover if database user has elevated privileges
+
+**Proof Evidence Required:**
+- HTTP request: `GET /admin/email_archive_manager.php?action=resend&archive_id=1 OR 1=1--`
+- Response change or SQL error message indicating injection
+- Time-based blind injection: `archive_id=1 AND SLEEP(5)--`
+
+**EXPLOITABILITY: CONFIRMED** (requires admin authentication, but exploitable)
 
 ---
 
@@ -335,37 +384,81 @@ eval('$keys .= ' . $value['set_function'] . '"' . zen_output_string($value['valu
 | V4 | SQL Execution (by design) | Critical | By Design | Admin |
 | V5 | Partial Command Injection | Medium | Limited | Admin |
 | V6 | Eval in Configuration | High | Chain-dependent | Admin + DB |
+| **V7** | **SQL Injection in Email Archive Manager** | **Critical** | **Confirmed** | Admin |
 
 ---
 
 ## RECOMMENDATIONS
 
 ### For V1 (Path Traversal):
-Add path traversal protection to the download action in `/admin/backup_mysql.php`:
+Add robust path traversal protection to the download action in `/admin/backup_mysql.php`:
 ```php
 case 'download':
-    if (strstr($_GET['file'], '..')) zen_redirect(zen_href_link(FILENAME_BACKUP_MYSQL));
-    // ... rest of existing code
+    $backupDir = realpath(DIR_FS_BACKUP);
+    $requested = isset($_GET['file']) ? basename($_GET['file']) : '';
+
+    // Build and validate the full path to the requested backup file
+    $filePath = $backupDir !== false && $requested !== ''
+        ? realpath($backupDir . DIRECTORY_SEPARATOR . $requested)
+        : false;
+
+    if ($backupDir === false ||
+        $filePath === false ||
+        strpos($filePath, $backupDir . DIRECTORY_SEPARATOR) !== 0 ||
+        !is_file($filePath)
+    ) {
+        zen_redirect(zen_href_link(FILENAME_BACKUP_MYSQL));
+    }
+    // ... rest of existing code that uses $filePath for the download
 ```
 
 ### For V2 (XSS):
 Apply proper HTML encoding in `/admin/coupon_admin.php`:
 ```php
-<td><?php echo htmlspecialchars($_POST['coupon_uses_coupon'], ENT_QUOTES, CHARSET); ?></td>
+<td><?php echo htmlspecialchars($_POST['coupon_uses_coupon'], ENT_QUOTES, 'UTF-8'); ?></td>
 ```
 
 ### For V3 (Header Injection):
-Sanitize filename in header output:
+Validate the requested backup file against the backup directory and use a safe filename in the header output:
 ```php
-$safe_filename = preg_replace('/[^a-zA-Z0-9._-]/', '', $_GET['file']);
-header('Content-disposition: attachment; filename=' . $safe_filename);
+$backupDir = DIR_FS_BACKUP; // Directory where backup files are stored
+$requested  = isset($_GET['file']) ? (string) $_GET['file'] : '';
+
+// Normalize to a simple filename and build the full path in the backup directory
+$filename   = basename($requested);
+$filePath   = realpath($backupDir . DIRECTORY_SEPARATOR . $filename);
+$backupRoot = realpath($backupDir);
+
+// Ensure the resolved path is inside the backup directory and points to an existing file
+if ($filename === '' ||
+    $filePath === false ||
+    $backupRoot === false ||
+    strpos($filePath, $backupRoot) !== 0 ||
+    !is_file($filePath)
+) {
+    // Invalid or non-existent backup file requested – handle gracefully
+    zen_redirect(zen_href_link(FILENAME_BACKUP_MYSQL));
+}
+
+// At this point, $filename is a valid backup filename under $backupDir
+header('Content-Disposition: attachment; filename="' . $filename . '"');
+```
+
+### For V7 (SQL Injection - CRITICAL):
+Apply integer cast to `archive_id` parameter in `/admin/email_archive_manager.php`:
+```php
+if ($action == 'resend') {
+    // collect the e-mail data
+    $email_sql = $db->Execute("select * from " . TABLE_EMAIL_ARCHIVE . " where archive_id = " . (int)$_GET['archive_id']);
 ```
 
 ---
 
 ## CONCLUSION
 
-This audit identified **6 vulnerabilities**, of which **2 are directly exploitable** by an authenticated admin user (V1, V2), **1 is an intentional feature** representing high risk (V4), and **3 have limited exploitability** due to mitigating factors or requiring attack chains (V3, V5, V6).
+This audit identified **7 vulnerabilities**, of which **3 are directly exploitable** by an authenticated admin user (V1, V2, **V7**), **1 is an intentional feature** representing high risk (V4), and **3 have limited exploitability** due to mitigating factors or requiring attack chains (V3, V5, V6).
+
+**CRITICAL FINDING - SQL Injection (V7):** The most severe newly discovered vulnerability is a SQL injection in `/admin/email_archive_manager.php` where `$_GET['archive_id']` is directly concatenated into a SQL query without sanitization. This allows an authenticated admin to execute arbitrary SQL commands.
 
 All confirmed vulnerabilities require admin authentication, significantly limiting the attack surface. However, if admin credentials are compromised through phishing or other means, these vulnerabilities could enable full system compromise.
 
