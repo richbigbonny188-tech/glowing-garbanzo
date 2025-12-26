@@ -119,7 +119,7 @@ This white-box security audit of the Deuth Zen Cart CMS (German customization of
 **Exact Condition:**
 - Admin must be authenticated
 - `action` parameter set to `download`
-- `file` parameter ends with `.sql`, `.gz`, or `zip`
+- `file` parameter ends with `.sql`, `.gz`, or `.zip` (note: code checks for `'zip'` without dot, which is consistent with `-3` substring)
 - No check for `..` sequences in the download action (unlike delete action)
 
 **Code Location:** `/admin/backup_mysql.php`, lines 285-302
