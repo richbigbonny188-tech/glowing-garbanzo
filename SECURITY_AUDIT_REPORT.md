@@ -102,6 +102,18 @@ This white-box security audit of the Deuth Zen Cart CMS (German customization of
 [USER CONTROL PRESERVED: YES]
 ```
 
+### Flow 7: Admin Plugin Page Inclusion (CVE-2024-5762)
+```
+[ENTRYPOINT] /admin/index.php?cmd=X
+[SOURCE] $_GET['cmd']
+[TRANSFORMATIONS]
+  - Line 15: Only 'index' → 'home' replacement
+  - Line 17-19: basename() check (can be bypassed)
+  - Line 64: Direct concatenation: $pluginDir . '/admin/' . $page . '.php'
+[SINK] require($adminPage) at line 29
+[USER CONTROL PRESERVED: YES]
+```
+
 ---
 
 ## PHASE 3: CONTROL ELIMINATION FILTER
@@ -343,6 +355,89 @@ if ($action == 'resend') {
 
 ---
 
+### VULNERABILITY 8: Local File Inclusion / Remote Code Execution (CVE-2024-5762)
+
+**CVE ID:** CVE-2024-5762 (CVSS 8.1 - High)
+
+**Affected Entrypoint:** `/admin/index.php?cmd=X`
+
+**Vulnerability Class:** CWE-98 (Improper Control of Filename for Include/Require Statement in PHP Program), CWE-829 (Inclusion of Functionality from Untrusted Control Sphere)
+
+**Exact Condition:**
+- Admin must be authenticated
+- `cmd` parameter is passed to `findPluginAdminPage()` function
+- Path traversal in `cmd` allows including arbitrary PHP files
+
+**Code Location:** 
+
+**File 1:** `/admin/index.php`, lines 14-29
+```php
+$cmd = isset($_GET['cmd']) ? $_GET['cmd'] : 'home';
+$cmd = ($cmd == 'index') ? 'home' : $cmd;
+
+if (file_exists(basename($cmd . '.php'))) {
+    require basename($cmd . '.php');
+    exit();
+}
+
+$adminPage = (new FileSystem)->findPluginAdminPage($installedPlugins, $cmd);
+if (!isset($adminPage)) {
+    require 'includes/application_top.php';
+    zen_redirect(zen_href_link(FILENAME_DEFAULT));
+    exit(0);
+}
+
+require($adminPage);
+```
+
+**File 2:** `/includes/classes/FileSystem.php`, lines 59-70
+```php
+public function findPluginAdminPage($installedPlugins, $page)
+{
+    $found = null;
+    foreach ($installedPlugins as $plugin) {
+        $pluginDir = DIR_FS_CATALOG . 'zc_plugins/' . $plugin['unique_key'] . '/' . $plugin['version'];
+        $adminFile = $pluginDir . '/admin/' . $page . '.php';
+        if (!file_exists($adminFile)) {
+            continue;
+        }
+        $found = $adminFile;
+    }
+    return $found;
+}
+```
+
+**Data Flow:**
+```
+[ENTRYPOINT] /admin/index.php?cmd=../../../../path/to/file
+[SOURCE] $_GET['cmd']
+[TRANSFORMATIONS]
+  - Line 15: Only replaces 'index' with 'home'
+  - Line 17-19: basename() check, but attacker can bypass by using path traversal
+  - Line 64: Direct concatenation into file path: $pluginDir . '/admin/' . $page . '.php'
+[SINK] require($adminPage) at line 29
+[USER CONTROL PRESERVED: YES]
+```
+
+**Impact:**
+- **Remote Code Execution:** If an attacker can upload a malicious PHP file (via file upload vulnerability, writable directories, or log poisoning), they can execute arbitrary code
+- **Local File Inclusion:** Read sensitive PHP files containing credentials or configuration
+- **Full server compromise** with web server privileges
+
+**Proof Evidence Required:**
+- HTTP request with path traversal: `GET /admin/index.php?cmd=../../../../../../etc/passwd%00`
+- For RCE: Chain with file upload to include uploaded PHP file
+- Server response showing included file content or code execution
+
+**EXPLOITABILITY: CONFIRMED** (requires admin authentication; Known CVE with public advisory)
+
+**References:**
+- NVD: https://nvd.nist.gov/vuln/detail/CVE-2024-5762
+- ZDI Advisory: ZDI-24-883
+- GitHub Advisory: GHSA-9j5g-j2hj-xfpc
+
+---
+
 ## PHASE 5: ATTACK CHAINS
 
 ### Chain 1: Admin Credential Theft → Full Compromise
@@ -372,6 +467,20 @@ if ($action == 'resend') {
 
 **Provability:** Verifiable with single HTTP request if admin session exists.
 
+### Chain 3: LFI + File Upload → Remote Code Execution (CVE-2024-5762)
+```
+[Entrypoint] /admin/index.php?cmd=../../uploads/malicious
+    ↓
+[Intermediate Effect] Path traversal in cmd parameter to reach uploaded file
+    ↓
+[Final Impact] Arbitrary PHP code execution with web server privileges
+```
+
+**Provability:** 
+1. Upload a PHP file via legitimate upload functionality (or exploit file upload vuln)
+2. Use LFI in admin/index.php to include the uploaded file
+3. Observe code execution (e.g., system commands, file creation)
+
 ---
 
 ## CONFIRMED VULNERABILITIES SUMMARY
@@ -385,6 +494,7 @@ if ($action == 'resend') {
 | V5 | Partial Command Injection | Medium | Limited | Admin |
 | V6 | Eval in Configuration | High | Chain-dependent | Admin + DB |
 | **V7** | **SQL Injection in Email Archive Manager** | **Critical** | **Confirmed** | Admin |
+| **V8** | **LFI/RCE (CVE-2024-5762)** | **Critical** | **Confirmed (Known CVE)** | Admin |
 
 ---
 
@@ -452,17 +562,69 @@ if ($action == 'resend') {
     $email_sql = $db->Execute("select * from " . TABLE_EMAIL_ARCHIVE . " where archive_id = " . (int)$_GET['archive_id']);
 ```
 
+### For V8 (LFI/RCE - CVE-2024-5762 - CRITICAL):
+Apply strict input validation in `/admin/index.php` and `/includes/classes/FileSystem.php`:
+
+**Option 1:** Whitelist allowed admin page names:
+```php
+// In admin/index.php - replace lines 14-22:
+$cmd = isset($_GET['cmd']) ? $_GET['cmd'] : 'home';
+$cmd = ($cmd == 'index') ? 'home' : $cmd;
+
+// Whitelist of allowed admin pages - prevent path traversal
+$allowed_pages = ['home', 'configuration', 'categories', 'products', /* ... other valid pages */];
+if (!preg_match('/^[a-zA-Z0-9_-]+$/', $cmd) || !in_array($cmd, $allowed_pages)) {
+    $cmd = 'home';
+}
+```
+
+**Option 2:** Strict validation in FileSystem class:
+```php
+// In includes/classes/FileSystem.php - modify findPluginAdminPage():
+public function findPluginAdminPage($installedPlugins, $page)
+{
+    // Validate page parameter - only alphanumeric, underscore, hyphen allowed
+    if (!preg_match('/^[a-zA-Z0-9_-]+$/', $page)) {
+        return null;
+    }
+    
+    $found = null;
+    foreach ($installedPlugins as $plugin) {
+        $pluginDir = DIR_FS_CATALOG . 'zc_plugins/' . $plugin['unique_key'] . '/' . $plugin['version'];
+        $adminFile = $pluginDir . '/admin/' . basename($page) . '.php';
+        
+        // Verify the resolved path is within expected directory
+        $realPath = realpath($adminFile);
+        $expectedBase = realpath($pluginDir . '/admin/');
+        
+        if ($realPath === false || $expectedBase === false || 
+            strpos($realPath, $expectedBase) !== 0) {
+            continue;
+        }
+        
+        $found = $adminFile;
+    }
+    return $found;
+}
+```
+
+**Recommended Action:** Upgrade to Zen Cart 2.0.0+ which contains the official patch for CVE-2024-5762.
+
 ---
 
 ## CONCLUSION
 
-This audit identified **7 vulnerabilities**, of which **3 are directly exploitable** by an authenticated admin user (V1, V2, **V7**), **1 is an intentional feature** representing high risk (V4), and **3 have limited exploitability** due to mitigating factors or requiring attack chains (V3, V5, V6).
+This audit identified **8 vulnerabilities**, of which **4 are directly exploitable** by an authenticated admin user (V1, V2, **V7**, **V8**), **1 is an intentional feature** representing high risk (V4), and **3 have limited exploitability** due to mitigating factors or requiring attack chains (V3, V5, V6).
 
-**CRITICAL FINDING - SQL Injection (V7):** The most severe newly discovered vulnerability is a SQL injection in `/admin/email_archive_manager.php` where `$_GET['archive_id']` is directly concatenated into a SQL query without sanitization. This allows an authenticated admin to execute arbitrary SQL commands.
+**CRITICAL FINDINGS:**
+
+1. **SQL Injection (V7):** The SQL injection in `/admin/email_archive_manager.php` where `$_GET['archive_id']` is directly concatenated into a SQL query without sanitization allows database compromise.
+
+2. **LFI/RCE - CVE-2024-5762 (V8):** A known vulnerability with public CVE affecting `findPluginAdminPage()` function. The `cmd` parameter in `/admin/index.php` can be manipulated via path traversal to include arbitrary PHP files, potentially leading to Remote Code Execution.
 
 All confirmed vulnerabilities require admin authentication, significantly limiting the attack surface. However, if admin credentials are compromised through phishing or other means, these vulnerabilities could enable full system compromise.
 
-**Key Finding:** The most critical real-world risk is the SQL Patch tool (V4), which is an intentional feature but represents significant exposure if admin credentials are compromised. Combined with the XSS vulnerability (V2), an attacker could potentially chain these to gain database access.
+**Key Finding:** The most critical real-world risk is **CVE-2024-5762 (V8)** which is a known vulnerability with public advisory. This should be patched immediately by upgrading to Zen Cart 2.0.0+.
 
 ---
 
